@@ -38,7 +38,8 @@ CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
 # default applies in production.
 OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.1:8b}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
-OPEN_WEBUI_PORT="${OPEN_WEBUI_PORT:-8080}"
+OPEN_WEBUI_PORT="${OPEN_WEBUI_PORT:-7500}"
+OPEN_WEBUI_VENV="${OPEN_WEBUI_VENV:-/workspace/cc-open-webui-venv}"
 
 # --- helpers --------------------------------------------------------------
 
@@ -118,22 +119,35 @@ if ! curl -fsS --max-time 2 "${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Open WebUI. The Vast template runs it via the `open-webui` pip package;
-# if it isn't up yet (or we're on a vanilla image), start it ourselves.
+# Open WebUI. The Vast template publishes Open WebUI on :7500 and Jupyter
+# on :8080; checking 8080 here waits on the wrong service. If the template
+# has not started Open WebUI yet (or this script is running on a plain CUDA
+# image), install a known-good executable into our own venv and start that.
 # The webui talks to ollama via OLLAMA_BASE_URL env; setting it explicitly
 # makes us robust to whatever default the template might or might not bake in.
 if ! port_responds "$OPEN_WEBUI_PORT"; then
-    if ! command -v open-webui >/dev/null 2>&1; then
-        log "open-webui binary not found; installing via pip"
-        # --break-system-packages keeps PEP 668 from rejecting the install
-        # on Ubuntu 22.04 images that mark the system Python externally
-        # managed. We're inside a disposable container — the safety lock
-        # protecting OS python doesn't buy us anything here.
-        pip install --no-cache-dir --break-system-packages open-webui
+    OPEN_WEBUI_BIN=""
+    if command -v open-webui >/dev/null 2>&1; then
+        OPEN_WEBUI_BIN="$(command -v open-webui)"
+    elif [ -x "${OPEN_WEBUI_VENV}/bin/open-webui" ]; then
+        OPEN_WEBUI_BIN="${OPEN_WEBUI_VENV}/bin/open-webui"
+    else
+        log "open-webui binary not found; installing into ${OPEN_WEBUI_VENV}"
+        mkdir -p "$(dirname "$OPEN_WEBUI_VENV")"
+        if ! python3 -m venv "$OPEN_WEBUI_VENV" >> /var/log/open-webui-install.log 2>&1; then
+            log "python3 venv module missing; installing python3-venv"
+            apt-get update >> /var/log/open-webui-install.log 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-pip >> /var/log/open-webui-install.log 2>&1
+            python3 -m venv "$OPEN_WEBUI_VENV" >> /var/log/open-webui-install.log 2>&1
+        fi
+        "${OPEN_WEBUI_VENV}/bin/python" -m pip install --upgrade pip >> /var/log/open-webui-install.log 2>&1
+        "${OPEN_WEBUI_VENV}/bin/pip" install --no-cache-dir open-webui >> /var/log/open-webui-install.log 2>&1
+        OPEN_WEBUI_BIN="${OPEN_WEBUI_VENV}/bin/open-webui"
     fi
-    log "starting open-webui serve on :${OPEN_WEBUI_PORT}"
+
+    log "starting ${OPEN_WEBUI_BIN} serve on :${OPEN_WEBUI_PORT}"
     OLLAMA_BASE_URL="$OLLAMA_HOST" \
-        nohup open-webui serve --host 0.0.0.0 --port "$OPEN_WEBUI_PORT" \
+        nohup "$OPEN_WEBUI_BIN" serve --host 0.0.0.0 --port "$OPEN_WEBUI_PORT" \
         > /var/log/open-webui.log 2>&1 &
 fi
 
