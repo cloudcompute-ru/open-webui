@@ -33,13 +33,15 @@ CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
 
 # Default model. llama3.1:8b is the v1 pick: ~5 GB on disk, fits in 12 GB
 # VRAM, and gives a working chat without a 10-minute wait on first connect.
-# Override with `OLLAMA_MODEL=llama3.3:70b bash provision.sh` (etc.) for
-# manual testing; the customer app launches us with no override so the
-# default applies in production.
-OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.1:8b}"
+# The Vast template itself exports OLLAMA_MODEL=qwen3.5:35b, which turns the
+# "quick start" path into a 23 GB download and can push 24 GB cards into a
+# slow first boot. Ignore the template default and use our app default unless
+# we explicitly pass a CloudCompute override.
+OLLAMA_MODEL="${CC_OLLAMA_MODEL:-llama3.1:8b}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
 OPEN_WEBUI_PORT="${OPEN_WEBUI_PORT:-7500}"
 OPEN_WEBUI_VENV="${OPEN_WEBUI_VENV:-/workspace/cc-open-webui-venv}"
+OPEN_WEBUI_SECRET_FILE="${OPEN_WEBUI_SECRET_FILE:-/workspace/.cc-open-webui-secret}"
 
 # --- helpers --------------------------------------------------------------
 
@@ -126,6 +128,20 @@ fi
 # The webui talks to ollama via OLLAMA_BASE_URL env; setting it explicitly
 # makes us robust to whatever default the template might or might not bake in.
 if ! port_responds "$OPEN_WEBUI_PORT"; then
+    if [ -z "${WEBUI_SECRET_KEY:-}" ]; then
+        if [ -s "$OPEN_WEBUI_SECRET_FILE" ]; then
+            WEBUI_SECRET_KEY="$(cat "$OPEN_WEBUI_SECRET_FILE")"
+        else
+            WEBUI_SECRET_KEY="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+)"
+            umask 077
+            printf '%s\n' "$WEBUI_SECRET_KEY" > "$OPEN_WEBUI_SECRET_FILE"
+        fi
+    fi
+
     OPEN_WEBUI_BIN=""
     if command -v open-webui >/dev/null 2>&1; then
         OPEN_WEBUI_BIN="$(command -v open-webui)"
@@ -147,6 +163,7 @@ if ! port_responds "$OPEN_WEBUI_PORT"; then
 
     log "starting ${OPEN_WEBUI_BIN} serve on :${OPEN_WEBUI_PORT}"
     OLLAMA_BASE_URL="$OLLAMA_HOST" \
+        WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" \
         nohup "$OPEN_WEBUI_BIN" serve --host 0.0.0.0 --port "$OPEN_WEBUI_PORT" \
         > /var/log/open-webui.log 2>&1 &
 fi
