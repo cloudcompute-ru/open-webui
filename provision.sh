@@ -17,16 +17,25 @@
 # Stage IDs reported here MUST match the application's manifest entry in
 # `config/applications.php` on the customer app side. Currently:
 #
-#   install_runtime    Ollama + Open WebUI reachable on their ports
+#   ensure_ollama      Ollama API answering on :11434
+#   ensure_open_webui  open-webui binary present, port :7500 reachable
 #   download_model     `ollama pull` of the default model
-#   start_server       Open WebUI binds OPEN_WEBUI_PORT and serves HTTP
+#   start_server       Open WebUI serves HTTP (final port check)
 #
-# Anything else is fine to log to stdout but won't drive the UI.
+# install_runtime was split into ensure_ollama + ensure_open_webui on
+# 2026-05-29 because the latter genuinely takes 5–15 min on a fresh Vast
+# image (pip-installs ~1 GB of deps) and a single opaque stage felt
+# broken to customers. The ensure_open_webui stage emits progress_pct
+# at coarse intervals so the wizard bar moves during the wait.
 #
 # stdout/stderr go to /var/log/cc-provision.log (the onstart wrapper sets
 # this up via `nohup ... > /var/log/cc-provision.log 2>&1 &`).
 
-set -euo pipefail
+# -E so the ERR trap propagates into functions and subshells; without
+# this the trap only catches errors at the top level and silent crashes
+# from inside while-read pipelines (like the one in download_model below)
+# would slip past the safety net.
+set -Eeuo pipefail
 
 CC_PROVISION_URL="${CC_PROVISION_URL:-}"
 CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
@@ -40,10 +49,24 @@ CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
 OLLAMA_MODEL="${CC_OLLAMA_MODEL:-llama3.1:8b}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
 OPEN_WEBUI_PORT="${OPEN_WEBUI_PORT:-7500}"
-OPEN_WEBUI_VENV="${OPEN_WEBUI_VENV:-/workspace/cc-open-webui-venv}"
-OPEN_WEBUI_SECRET_FILE="${OPEN_WEBUI_SECRET_FILE:-/workspace/.cc-open-webui-secret}"
+
+# /root is always present on Vast containers; /workspace is template-
+# dependent and is *missing* on vastai/openwebui:v0.8.12. The previous
+# revision of this script wrote the WebUI secret to /workspace/... and
+# the redirect crashed before any further stage report could fire,
+# leaving the wizard frozen on the first stage indefinitely (incident
+# 2026-05-29).
+OPEN_WEBUI_HOME="${OPEN_WEBUI_HOME:-/root/cc-open-webui}"
+OPEN_WEBUI_VENV="${OPEN_WEBUI_VENV:-${OPEN_WEBUI_HOME}/venv}"
+OPEN_WEBUI_SECRET_FILE="${OPEN_WEBUI_SECRET_FILE:-${OPEN_WEBUI_HOME}/secret}"
+mkdir -p "$OPEN_WEBUI_HOME"
 
 # --- helpers --------------------------------------------------------------
+
+# Stage the script is currently executing. The ERR trap surfaces this back
+# to the API so the wizard can show a real error instead of a stage that
+# just never advances when something blows up underneath us.
+CC_CURRENT_STAGE="bootstrap"
 
 # report_stage <json-payload>
 #
@@ -70,6 +93,22 @@ log() {
     echo "[cc-provision] $*"
 }
 
+# Final stage report on unexpected failure. Without this, an early-exit
+# from set -e leaves the wizard sitting on whatever stage was most-recently
+# reported — exactly what happened on 2026-05-29 when /workspace/ didn't
+# exist and the redirect crashed before any further report had a chance
+# to fire. Best-effort: if even this report fails we still exit with
+# the original code so the onstart wrapper sees the failure too.
+on_error() {
+    local rc=$?
+    local line=${BASH_LINENO[0]:-?}
+    log "ERR trap fired at line $line (stage=$CC_CURRENT_STAGE, rc=$rc)"
+    local msg="Скрипт упал на этапе ${CC_CURRENT_STAGE} (строка ${line}, код ${rc}). См. /var/log/cc-provision.log."
+    report_stage "{\"stage\":\"${CC_CURRENT_STAGE}\",\"message\":\"${msg}\"}"
+    exit "$rc"
+}
+trap on_error ERR
+
 # port_responds <port>
 #
 # True if something is bound on `localhost:<port>` and answering HTTP.
@@ -80,21 +119,18 @@ port_responds() {
     curl -fsS --max-time 1 "http://127.0.0.1:${1}/" >/dev/null 2>&1
 }
 
-# --- stage 1: install_runtime --------------------------------------------
+# --- stage 1: ensure_ollama ----------------------------------------------
 #
-# The `open-webui` Vast.ai template (hash d34be35..., see
-# resources/vastai-templates/open-webui.md on the customer-app side)
-# ships Ubuntu 22.04 + CUDA 12 + Ollama + Open WebUI 0.8 preinstalled,
-# and typically starts both as background services on container boot.
-# We defensively re-start whichever isn't reachable yet — covers the
-# case where the template image drifted, or someone is running this
-# script on a vanilla CUDA image instead of the template.
+# The Vast `open-webui` template has Ollama preinstalled. In practice the
+# multi-ENTRYPOINT collision with Jupyter means it sometimes auto-starts
+# (current observation: yes, ollama listens on :11434 by the time we get
+# here), and sometimes won't on future template revisions. We defensively
+# verify reachability and start it if missing.
 
-log "stage: install_runtime"
-report_stage '{"stage":"install_runtime"}'
+CC_CURRENT_STAGE="ensure_ollama"
+log "stage: ensure_ollama"
+report_stage '{"stage":"ensure_ollama"}'
 
-# Ollama daemon. The standard binary location after the upstream installer.
-# `ollama serve` starts the HTTP API on :11434 (default OLLAMA_HOST).
 if ! curl -fsS --max-time 2 "${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
     if ! command -v ollama >/dev/null 2>&1; then
         log "ollama binary not found; installing from upstream"
@@ -106,7 +142,6 @@ if ! curl -fsS --max-time 2 "${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
     # leave it on the loopback default since Open WebUI is the only
     # local consumer and the customer reaches Ollama through it.
     nohup ollama serve > /var/log/ollama.log 2>&1 &
-    # Brief wait so the next stage doesn't race the bind.
     for _ in $(seq 1 20); do
         if curl -fsS --max-time 1 "${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
             break
@@ -117,60 +152,153 @@ fi
 
 if ! curl -fsS --max-time 2 "${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
     log "ollama did not become reachable on ${OLLAMA_HOST} within 20s"
-    report_stage '{"stage":"install_runtime","message":"Ollama не запустился. См. /var/log/ollama.log."}'
+    report_stage '{"stage":"ensure_ollama","message":"Ollama не запустился. См. /var/log/ollama.log."}'
     exit 1
 fi
 
-# Open WebUI. The Vast template publishes Open WebUI on :7500 and Jupyter
-# on :8080; checking 8080 here waits on the wrong service. If the template
-# has not started Open WebUI yet (or this script is running on a plain CUDA
-# image), install a known-good executable into our own venv and start that.
-# The webui talks to ollama via OLLAMA_BASE_URL env; setting it explicitly
-# makes us robust to whatever default the template might or might not bake in.
-if ! port_responds "$OPEN_WEBUI_PORT"; then
-    if [ -z "${WEBUI_SECRET_KEY:-}" ]; then
-        if [ -s "$OPEN_WEBUI_SECRET_FILE" ]; then
-            WEBUI_SECRET_KEY="$(cat "$OPEN_WEBUI_SECRET_FILE")"
-        else
-            WEBUI_SECRET_KEY="$(python3 - <<'PY'
+# --- stage 2: ensure_open_webui ------------------------------------------
+#
+# The vastai/openwebui:v0.8.12 template does NOT ship a runnable
+# open-webui binary (verified 2026-05-29 via SSH: `which open-webui`
+# empty, `python3 -c 'import open_webui'` ModuleNotFoundError, `find /`
+# turned up nothing). The image name implies otherwise — what actually
+# ships is Ollama + the supporting CUDA stack — so we always install
+# Open WebUI fresh into our own venv.
+#
+# pip install open-webui pulls ~1 GB of deps (chromadb,
+# sentence-transformers, fastapi, langchain bits, etc.) and takes
+# 5–15 min on a typical Vast machine. We emit progress_pct at coarse
+# milestones so the wizard bar moves during the wait instead of looking
+# frozen. A background ticker advances 35→85% during the long pip step
+# and we jump to 90% once pip exits 0.
+
+CC_CURRENT_STAGE="ensure_open_webui"
+log "stage: ensure_open_webui"
+report_stage '{"stage":"ensure_open_webui","progress_pct":0}'
+
+INSTALL_LOG=/var/log/open-webui-install.log
+: > "$INSTALL_LOG"
+
+OPEN_WEBUI_BIN=""
+
+# Fast paths first. If a future template variant ships open-webui as a
+# real binary, or if a previous run of this script already installed it,
+# skip the 10-minute pip install.
+for candidate in \
+    "$OPEN_WEBUI_VENV/bin/open-webui" \
+    /usr/local/bin/open-webui \
+    /opt/conda/bin/open-webui \
+    /opt/venv/bin/open-webui \
+    /opt/sys-venv/bin/open-webui \
+    /root/.local/bin/open-webui
+do
+    if [ -x "$candidate" ]; then
+        OPEN_WEBUI_BIN="$candidate"
+        log "found existing open-webui at $OPEN_WEBUI_BIN, skipping pip install"
+        report_stage '{"stage":"ensure_open_webui","progress_pct":90}'
+        break
+    fi
+done
+
+if [ -z "$OPEN_WEBUI_BIN" ] && command -v open-webui >/dev/null 2>&1; then
+    OPEN_WEBUI_BIN="$(command -v open-webui)"
+    log "found existing open-webui on PATH at $OPEN_WEBUI_BIN"
+    report_stage '{"stage":"ensure_open_webui","progress_pct":90}'
+fi
+
+# Module-importable but no console script (rare; could happen if a base
+# image used pip's --no-scripts). Start via `python3 -m open_webui`.
+if [ -z "$OPEN_WEBUI_BIN" ] && python3 -c 'import open_webui' >/dev/null 2>&1; then
+    OPEN_WEBUI_BIN="python3 -m open_webui"
+    log "open_webui module importable; using 'python3 -m open_webui'"
+    report_stage '{"stage":"ensure_open_webui","progress_pct":90}'
+fi
+
+if [ -z "$OPEN_WEBUI_BIN" ]; then
+    log "open-webui not preinstalled, installing into $OPEN_WEBUI_VENV (5–15 min)"
+    report_stage '{"stage":"ensure_open_webui","progress_pct":5}'
+
+    if ! python3 -m venv "$OPEN_WEBUI_VENV" >> "$INSTALL_LOG" 2>&1; then
+        log "python3 venv module missing; installing python3-venv"
+        apt-get update >> "$INSTALL_LOG" 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-pip >> "$INSTALL_LOG" 2>&1
+        python3 -m venv "$OPEN_WEBUI_VENV" >> "$INSTALL_LOG" 2>&1
+    fi
+
+    report_stage '{"stage":"ensure_open_webui","progress_pct":15}'
+
+    "${OPEN_WEBUI_VENV}/bin/python" -m pip install --upgrade pip >> "$INSTALL_LOG" 2>&1
+    report_stage '{"stage":"ensure_open_webui","progress_pct":25}'
+
+    # Tail the install log into our own log too, so SSH debug doesn't
+    # have to chase two files. tee runs in background and dies when its
+    # input fd is closed (i.e. when pip finishes).
+    tail -F "$INSTALL_LOG" 2>/dev/null | sed 's/^/[pip] /' &
+    tail_pid=$!
+
+    # Advance the progress bar 35→85% on a fixed timer during the long
+    # pip step. The actual pip command finishes whenever it finishes;
+    # the ticker just keeps the UI alive. We kill it before reporting 90%
+    # so the ticker can't emit a stale 85% AFTER our 90% report.
+    (
+        for pct in 35 45 55 65 75 85; do
+            sleep 60
+            report_stage "{\"stage\":\"ensure_open_webui\",\"progress_pct\":${pct}}" || true
+        done
+    ) &
+    ticker_pid=$!
+
+    set +e
+    "${OPEN_WEBUI_VENV}/bin/pip" install --no-cache-dir open-webui >> "$INSTALL_LOG" 2>&1
+    pip_status=$?
+    set -e
+
+    kill "$ticker_pid" 2>/dev/null || true
+    wait "$ticker_pid" 2>/dev/null || true
+    kill "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
+
+    if [ "$pip_status" -ne 0 ]; then
+        log "pip install open-webui failed with exit $pip_status"
+        # Last few lines of the install log give the customer something
+        # actionable in the wizard's error card. 500-char cap matches
+        # comfyui-flux's start_server convention.
+        tail_msg="$(tail -c 500 "$INSTALL_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        report_stage "{\"stage\":\"ensure_open_webui\",\"message\":\"pip install open-webui упал. ${tail_msg}\"}"
+        exit "$pip_status"
+    fi
+
+    OPEN_WEBUI_BIN="${OPEN_WEBUI_VENV}/bin/open-webui"
+    report_stage '{"stage":"ensure_open_webui","progress_pct":90}'
+fi
+
+# Secret key — generate once and persist so customer's existing chat
+# sessions survive a stop/start cycle.
+if [ -s "$OPEN_WEBUI_SECRET_FILE" ]; then
+    WEBUI_SECRET_KEY="$(cat "$OPEN_WEBUI_SECRET_FILE")"
+else
+    WEBUI_SECRET_KEY="$(python3 - <<'PY'
 import secrets
 print(secrets.token_urlsafe(48))
 PY
 )"
-            umask 077
-            printf '%s\n' "$WEBUI_SECRET_KEY" > "$OPEN_WEBUI_SECRET_FILE"
-        fi
-    fi
+    umask 077
+    printf '%s\n' "$WEBUI_SECRET_KEY" > "$OPEN_WEBUI_SECRET_FILE"
+fi
 
-    OPEN_WEBUI_BIN=""
-    if command -v open-webui >/dev/null 2>&1; then
-        OPEN_WEBUI_BIN="$(command -v open-webui)"
-    elif [ -x "${OPEN_WEBUI_VENV}/bin/open-webui" ]; then
-        OPEN_WEBUI_BIN="${OPEN_WEBUI_VENV}/bin/open-webui"
-    else
-        log "open-webui binary not found; installing into ${OPEN_WEBUI_VENV}"
-        mkdir -p "$(dirname "$OPEN_WEBUI_VENV")"
-        if ! python3 -m venv "$OPEN_WEBUI_VENV" >> /var/log/open-webui-install.log 2>&1; then
-            log "python3 venv module missing; installing python3-venv"
-            apt-get update >> /var/log/open-webui-install.log 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-pip >> /var/log/open-webui-install.log 2>&1
-            python3 -m venv "$OPEN_WEBUI_VENV" >> /var/log/open-webui-install.log 2>&1
-        fi
-        "${OPEN_WEBUI_VENV}/bin/python" -m pip install --upgrade pip >> /var/log/open-webui-install.log 2>&1
-        "${OPEN_WEBUI_VENV}/bin/pip" install --no-cache-dir open-webui >> /var/log/open-webui-install.log 2>&1
-        OPEN_WEBUI_BIN="${OPEN_WEBUI_VENV}/bin/open-webui"
-    fi
-
-    log "starting ${OPEN_WEBUI_BIN} serve on :${OPEN_WEBUI_PORT}"
+if ! port_responds "$OPEN_WEBUI_PORT"; then
+    log "starting open-webui serve on :${OPEN_WEBUI_PORT}"
+    # OPEN_WEBUI_BIN may be a multi-word command ("python3 -m open_webui"),
+    # so we deliberately leave it unquoted. shellcheck-disable.
+    # shellcheck disable=SC2086
     OLLAMA_BASE_URL="$OLLAMA_HOST" \
         WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" \
-        nohup "$OPEN_WEBUI_BIN" serve --host 0.0.0.0 --port "$OPEN_WEBUI_PORT" \
+        nohup $OPEN_WEBUI_BIN serve --host 0.0.0.0 --port "$OPEN_WEBUI_PORT" \
         > /var/log/open-webui.log 2>&1 &
 fi
 
-# Sanity wait — we only need to know it *can* start. The real ready-check
-# happens in stage 3; here we just want a clear failure mode if the binary
-# crashes immediately on launch.
+# Sanity wait — we only need to know it can come up. The hard ready-check
+# is start_server below, which has the real timeout.
 for _ in $(seq 1 30); do
     if port_responds "$OPEN_WEBUI_PORT"; then
         break
@@ -178,10 +306,12 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
-log "install_runtime: ollama=ok, open-webui port=$(port_responds "$OPEN_WEBUI_PORT" && echo up || echo not-yet)"
+report_stage '{"stage":"ensure_open_webui","progress_pct":100}'
+log "ensure_open_webui done: bin=$OPEN_WEBUI_BIN port=$(port_responds "$OPEN_WEBUI_PORT" && echo up || echo not-yet)"
 
-# --- stage 2: download_model ---------------------------------------------
+# --- stage 3: download_model ---------------------------------------------
 
+CC_CURRENT_STAGE="download_model"
 log "stage: download_model (${OLLAMA_MODEL})"
 report_stage "{\"stage\":\"download_model\",\"progress_pct\":0}"
 
@@ -238,13 +368,14 @@ else
     report_stage '{"stage":"download_model","progress_pct":100}'
 fi
 
-# --- stage 3: start_server -----------------------------------------------
+# --- stage 4: start_server -----------------------------------------------
 #
-# Stage 1 already started Open WebUI (or trusted that the template did);
-# here we just wait until it's actually answering HTTP, then declare
-# done. Mirrors comfyui-flux's start_server contract so the customer-app
-# frontend's provision_marker ready-check fires the moment we exit 0.
+# ensure_open_webui already started Open WebUI; here we just wait until
+# it's actually answering HTTP, then declare done. Mirrors comfyui-flux's
+# start_server contract so the customer-app frontend's provision_marker
+# ready-check fires the moment we exit 0.
 
+CC_CURRENT_STAGE="start_server"
 log "stage: start_server"
 report_stage '{"stage":"start_server"}'
 
