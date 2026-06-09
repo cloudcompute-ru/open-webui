@@ -19,7 +19,7 @@
 #
 #   ensure_ollama      Ollama API answering on :11434
 #   ensure_open_webui  open-webui binary present, port :7500 reachable
-#   download_model     `ollama pull` of the default model
+#   download_model     `ollama pull` of the selected model
 #   start_server       Open WebUI serves HTTP (final port check)
 #
 # install_runtime was split into ensure_ollama + ensure_open_webui on
@@ -47,6 +47,7 @@ CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
 # slow first boot. Ignore the template default and use our app default unless
 # we explicitly pass a CloudCompute override.
 OLLAMA_MODEL="${CC_OLLAMA_MODEL:-llama3.1:8b}"
+MODEL_DISPLAY_NAME="${CC_MODEL_DISPLAY_NAME:-$OLLAMA_MODEL}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
 OPEN_WEBUI_PORT="${OPEN_WEBUI_PORT:-7500}"
 
@@ -117,6 +118,39 @@ trap on_error ERR
 # ready to actually serve requests, and we want to gate on the latter.
 port_responds() {
     curl -fsS --max-time 1 "http://127.0.0.1:${1}/" >/dev/null 2>&1
+}
+
+# run_user_hook <stage-id>
+#
+# Runs the customer-supplied setup script, if any. Called once ollama is up and
+# open-webui is installed but BEFORE open-webui serves, so anything the script
+# does (e.g. `ollama pull` a custom model, tweak config) is in place for the
+# single open-webui boot below — no restart needed.
+#
+# The script arrives base64-encoded in CC_USER_SETUP_B64 (base64 sidesteps all
+# shell-quoting hazards). Its stdout/stderr lands in /var/log/cc-provision.log,
+# so it shows up in the dashboard log tail. A non-zero exit aborts provisioning
+# and surfaces the failure to the wizard.
+run_user_hook() {
+    [ -n "${CC_USER_SETUP_B64:-}" ] || return 0
+    _stage="${1:-start_server}"
+    log "running custom setup script"
+    report_stage "{\"stage\":\"${_stage}\",\"message\":\"running custom setup script\"}"
+    if ! printf '%s' "$CC_USER_SETUP_B64" | base64 -d > /tmp/cc-user-setup.sh 2>/dev/null; then
+        log "could not decode CC_USER_SETUP_B64; skipping custom setup"
+        return 0
+    fi
+    chmod +x /tmp/cc-user-setup.sh
+    set +e
+    bash /tmp/cc-user-setup.sh 2>&1 | sed 's/^/[user-setup] /'
+    _rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$_rc" -ne 0 ]; then
+        _tail="$(tail -c 400 /var/log/cc-provision.log 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        report_stage "{\"stage\":\"${_stage}\",\"message\":\"custom setup script failed (exit ${_rc}): ${_tail}\"}"
+        exit "$_rc"
+    fi
+    log "custom setup script finished"
 }
 
 # --- stage 1: ensure_ollama ----------------------------------------------
@@ -286,6 +320,11 @@ PY
     printf '%s\n' "$WEBUI_SECRET_KEY" > "$OPEN_WEBUI_SECRET_FILE"
 fi
 
+# Custom setup runs here — ollama is up and open-webui is installed, but
+# open-webui hasn't served yet, so a user `ollama pull` / config tweak is in
+# place for the single boot below.
+run_user_hook "ensure_open_webui"
+
 if ! port_responds "$OPEN_WEBUI_PORT"; then
     log "starting open-webui serve on :${OPEN_WEBUI_PORT}"
     # OPEN_WEBUI_BIN may be a multi-word command ("python3 -m open_webui"),
@@ -312,7 +351,7 @@ log "ensure_open_webui done: bin=$OPEN_WEBUI_BIN port=$(port_responds "$OPEN_WEB
 # --- stage 3: download_model ---------------------------------------------
 
 CC_CURRENT_STAGE="download_model"
-log "stage: download_model (${OLLAMA_MODEL})"
+log "stage: download_model (${MODEL_DISPLAY_NAME}: ${OLLAMA_MODEL})"
 report_stage "{\"stage\":\"download_model\",\"progress_pct\":0}"
 
 # Skip the pull if the model is already present. `ollama list` outputs
@@ -359,9 +398,9 @@ else
         log "ollama pull failed with exit $pull_status"
         # `ollama pull` itself prints the real error (e.g. "Error: model not
         # found" or a network failure) to its own stderr, which we already
-        # tee'd above. The stage-message field is the short, user-facing
-        # version that surfaces in the wizard.
-        report_stage "{\"stage\":\"download_model\",\"message\":\"ollama pull завершился с кодом ${pull_status}. См. /var/log/cc-provision.log.\"}"
+        # tee'd above. V1 keeps recovery simple: tell the customer the model
+        # is not supported/found and advise deleting the rented instance.
+        report_stage "{\"stage\":\"download_model\",\"message\":\"Модель ${OLLAMA_MODEL} не поддерживается или не найдена в Ollama. Удалите этот инстанс и попробуйте запустить приложение с другой моделью.\"}"
         exit "$pull_status"
     fi
 
