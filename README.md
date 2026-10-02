@@ -1,49 +1,23 @@
-# Open WebUI с Llama 3.1
+# open-webui (CloudCompute chatbot runtime)
 
-Готовый launcher для **[Open WebUI](https://github.com/open-webui/open-webui)** поверх **[Ollama](https://ollama.com)** с предустановленной моделью **[Llama 3.1 8B](https://ollama.com/library/llama3.1)**. Поднимает знакомый ChatGPT-подобный веб-чат на `0.0.0.0:8080` на свежем NVIDIA-контейнере одной командой — без ручной установки модели и без возни с conda-окружениями.
+`provision.sh` for the customer-app **chatbot** application (`/applications/chatbot`).
 
-Подходит для приватных диалогов с open-source LLM на собственной (или арендованной) видеокарте, в том числе если вы не хотите отправлять переписку в OpenAI / Anthropic и при этом не готовы вечером поднимать стек локально.
+## Docker image (P1 baked runtime)
 
-## Что нужно
+The Vast `vastai/openwebui` template does not ship a runnable `open-webui` binary. We bake it into:
 
-Linux с одной NVIDIA GPU от **12 ГБ VRAM** (RTX 3090, RTX 4070 Ti, RTX 4090, A6000, A100, H100 — все подходят) и актуальный CUDA-драйвер. Llama 3.1 8B в Q4_K_M-квантизации (Ollama-формат по умолчанию) занимает ~5 ГБ VRAM и оставляет щедрый запас контекста. Если VRAM позволяет, после старта можно скачать модели побольше (Llama 3.3 70B, Qwen 2.5 32B/72B, DeepSeek-R1 и др.) прямо из веб-интерфейса.
+`cloudcomputeru/openwebui:v1`
 
-## Запуск
-
-```bash
-git clone https://github.com/cloudcompute-ru/open-webui.git
-cd open-webui
-bash provision.sh
-```
-
-После сообщения `provisioning complete` откройте `http://<host>:8080/` в браузере. **На первом заходе Open WebUI попросит создать аккаунт администратора** — это не фишинг, это штатное поведение Open WebUI: первый зарегистрированный пользователь становится владельцем инстанса. Регистрация локальная, никаких email-подтверждений нет.
-
-`provision.sh` идемпотентен: если Ollama-модель уже скачана, повторный запуск пропускает этот шаг.
-
-## Что внутри
-
-- `provision.sh` — проверяет, что Ollama (`:11434`) и Open WebUI (`:8080`) запущены, при необходимости стартует их, скачивает модель Llama 3.1 8B и ждёт готовности веб-интерфейса.
-- Переменные окружения для тонкой настройки:
-  - `OLLAMA_MODEL` — какую модель предзагрузить (по умолчанию `llama3.1:8b`).
-  - `OPEN_WEBUI_PORT` — порт веб-интерфейса (по умолчанию `8080`).
-  - `OLLAMA_HOST` — куда Open WebUI обращается за инференсом (по умолчанию `http://localhost:11434`).
-
-## Подкачка других моделей
-
-Из веб-интерфейса: **Settings → Admin → Models → Pull a model from Ollama.com**. Можно вписать любое имя из [библиотеки Ollama](https://ollama.com/library): `llama3.3:70b`, `qwen2.5:32b-instruct`, `deepseek-r1:32b`, `mistral-small:24b` и т. д. Качайте под доступную VRAM — 70B-модели потребуют 48+ ГБ.
-
-Из командной строки на хосте:
+Build locally:
 
 ```bash
-ollama pull llama3.3:70b
+docker build -t cloudcomputeru/openwebui:v1 .
 ```
 
-После `pull` модель сразу появится в селекторе модели в чате.
+CI pushes on git tags `v*` (requires `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repo secrets).
 
-## Про cloudcompute.ru
+The customer app launches chatbot with `runtime.image` set to that tag (see `config/applications.php` in the main app repo).
 
-Этот репозиторий поддерживает [cloudcompute.ru](https://cloudcompute.ru) — российский GPU-хостинг с почасовой оплатой. Если не хочется самостоятельно арендовать видеокарту и поднимать контейнер, [cloudcompute.ru/tutorials/chatbot](https://cloudcompute.ru/tutorials/chatbot) — это тот же скрипт, запущенный в один клик: подбор подходящей видеокарты, оплата по факту работы (от ~35 ₽/час), готовый чат-бот в браузере через 5 минут. Без локальной установки и без 5 ГБ загрузки на свой диск.
+## provision.sh
 
-## Лицензии
-
-Скрипты и конфигурация — MIT (см. `LICENSE`). Open WebUI распространяется под **BSD-3-Clause**, Ollama — **MIT**. Модель Llama 3.1 распространяется под **Llama 3.1 Community License Agreement** (Meta) — коммерческое использование разрешено при MAU ≤ 700M. Этот репозиторий устанавливает все три проекта в runtime, но не модифицирует и не перераспространяет.
+Pinned by SHA in `config/applications.php` → `provisioning.script_sha`. After changing this file, commit, push, and bump the SHA in the customer app.

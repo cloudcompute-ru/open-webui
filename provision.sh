@@ -219,6 +219,7 @@ OPEN_WEBUI_BIN=""
 # real binary, or if a previous run of this script already installed it,
 # skip the 10-minute pip install.
 for candidate in \
+    /opt/cc-open-webui-venv/bin/open-webui \
     "$OPEN_WEBUI_VENV/bin/open-webui" \
     /usr/local/bin/open-webui \
     /opt/conda/bin/open-webui \
